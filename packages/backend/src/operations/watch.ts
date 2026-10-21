@@ -1,16 +1,8 @@
-// The worker watchdog, run from the api process: the worker cannot report its own death.
+// The worker watchdog, run from the api process (the worker cannot report its own death). It keeps its
+// state in settings and sends its own alerts.
 import { sql } from "../db.ts";
-import { beijingStamp, formatAlert, formatRecovery, sendAlert, type Finding } from "../notify/feishu.ts";
-
-async function readSetting<T>(key: string): Promise<T | null> {
-  const [row] = await sql<{ value: T }[]>`SELECT value FROM settings WHERE key = ${key}`;
-  return row?.value ?? null;
-}
-
-async function writeSetting(key: string, value: unknown, by: string) {
-  await sql`INSERT INTO settings (key, value, updated_by) VALUES (${key}, ${sql.json(value as never)}, ${by})
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`;
-}
+import { closeAgentWake, wakeAgent } from "../notify/agent.ts";
+import { formatAlert, formatRecovery, sendAlert, type Finding } from "../notify/feishu.ts";
 
 // The process manager restarts a crashed worker within seconds and a deploy restarts it on purpose;
 // half an hour without a heartbeat means those did not help.
@@ -22,36 +14,41 @@ const WORKER_DOWN: Finding = {
   title: "后台处理服务停了，网站不会出现新内容",
   impact: "新内容的采集、处理、推送和日报全部暂停，网站停在旧内容上",
   heals: "系统自动重启没有成功",
-  action: "转给 AI 立即处理",
+  action: "尽快发起一次维护处理",
 };
 
 /**
- * Runs in the api process (the worker cannot report its own death): alerts once when the worker's
- * heartbeat is older than half an hour, and once when it recovers. Several api processes may check;
- * the conditional update lets only one of them send.
+ * Runs in the api process: alerts once when the worker's heartbeat is older than half an hour, and once
+ * when it recovers. The stored state moves only after the message went out, so a failed send is tried
+ * again at the next check; the lock keeps two api processes (two overlap during a deploy) from both sending.
  */
 export async function checkWorkerHeartbeat(): Promise<void> {
-  const [hb] = await sql<{ updated_at: Date }[]>`SELECT updated_at FROM settings WHERE key = 'heartbeat.worker'`;
-  if (!hb) return;
-  const stale = Date.now() - hb.updated_at.getTime() > WORKER_STALE_MS;
-  const next = stale ? "down" : "up";
-  const prior = await readSetting<{ state: string; since: string }>("watchdog.worker");
-  if (!prior && !stale) {
-    await writeSetting("watchdog.worker", { state: "up", since: new Date().toISOString() }, "api");
-    return;
-  }
-  // "since" of a down state is the last heartbeat, so the recovery can say how long it lasted.
-  const since = stale ? hb.updated_at.toISOString() : new Date().toISOString();
-  const claimed = await sql`
-    INSERT INTO settings (key, value, updated_by) VALUES ('watchdog.worker', ${sql.json({ state: next, since })}, 'api')
-    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
-    WHERE settings.value->>'state' IS DISTINCT FROM ${next}
-    RETURNING key`;
-  if (!claimed.length) return;
-  const msg = stale
-    ? formatAlert({ ...WORKER_DOWN, detail: `worker 心跳停在 ${beijingStamp(hb.updated_at)}；看 worker 的日志（docker compose logs worker）` }, hb.updated_at, Date.now())
-    : formatRecovery(WORKER_DOWN.title, new Date(prior?.state === "down" ? prior.since : hb.updated_at), Date.now());
-  await sendAlert(msg.title, msg.lines);
+  const wentDown = await sql.begin(async (tx) => {
+    await tx`SELECT pg_advisory_xact_lock(hashtext('watchdog.worker'))`;
+    const [hb] = await tx<{ updated_at: Date }[]>`SELECT updated_at FROM settings WHERE key = 'heartbeat.worker'`;
+    if (!hb) return null;
+    const [prior] = await tx<{ value: { state: "up" | "down"; since: string; handoff?: true } }[]>`SELECT value FROM settings WHERE key = 'watchdog.worker'`;
+    const now = Date.now();
+    const stale = now - hb.updated_at.getTime() > WORKER_STALE_MS;
+    const state = stale ? "down" : "up";
+    if (prior?.value.state === state) return stale ? { since: new Date(prior.value.since), handoff: !!prior.value.handoff } : null;
+    // A first check that finds the worker running only records it.
+    if (stale) {
+      const msg = formatAlert(WORKER_DOWN, hb.updated_at, now);
+      await sendAlert(msg.title, msg.lines);
+    } else if (prior) {
+      const msg = formatRecovery(WORKER_DOWN.title, new Date(prior.value.since), now);
+      await sendAlert(msg.title, msg.lines);
+      await closeAgentWake(WORKER_DOWN.key);
+    }
+    // "since" of a down state is the last heartbeat, so the recovery can say how long it lasted.
+    const since = stale ? hb.updated_at : new Date(now);
+    await tx`INSERT INTO settings (key, value, updated_by) VALUES ('watchdog.worker', ${tx.json({ state, since: since.toISOString(), handoff: true })}, 'api')
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = now()`;
+    return stale ? { since: hb.updated_at, handoff: true } : null;
+  });
+  // Every stale check resumes the durable handoff; accepted/unknown calls are not sent again.
+  if (wentDown) await wakeAgent({ ...WORKER_DOWN, since: wentDown.since }, Date.now(), wentDown.handoff);
 }
 
 export function startWorkerWatchdog(): NodeJS.Timeout {
