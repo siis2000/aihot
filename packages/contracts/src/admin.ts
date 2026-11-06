@@ -162,7 +162,7 @@ export interface AdminSourceDetail {
   source: AdminSource;
   runs: Array<{
     id: number; started_at: Timestamp; finished_at: Timestamp | null; status: string; found_count: number | null; new_count: number | null; error: string | null;
-    detail: { pages?: number; backlog?: number; dropped?: number; presentationFailures?: Array<{ url: string; error: string }> } | null;
+    detail: { pages?: number; backlog?: number; dropped?: number } | null;
   }>;
   items: Array<{ id: string; title: string; url: string; discovered_at: Timestamp; published_at: Timestamp | null; processing_state: string; selected: boolean | null; visibility: string | null; title_zh: string | null }>;
   stats: { total: number; last7d: number; selected: number };
@@ -403,7 +403,7 @@ export interface AdminModelUsage {
 
 export interface AdminModels {
   days: number;
-  capabilities: Array<{ key: string; label: string; env: string; defaultModel: string; vision: boolean; current: { model: string; source: "admin" | "env" | "default" }; fallback: { model: string; primaryPaused: boolean; backupPaused: boolean; nextProbeAt: string | null } | null; usage: AdminModelUsage[] }>;
+  capabilities: Array<{ key: string; label: string; env: string; defaultModel: string; vision: boolean; current: { model: string; source: "admin" | "env" | "default"; invalid?: string }; fallback: { model: string; primaryPaused: boolean; backupPaused: boolean; nextProbeAt: string | null } | null; usage: AdminModelUsage[] }>;
   choices: Array<{ key: string; service: string; vision: boolean }>;
   history: Array<{ at: Timestamp; actor: string; subject: string; reason: string | null; before: { model: string; source: string } | null; after: { model: string; source: string } | null }>;
   benches: Array<{ id: string; label: string; sample_size: number; prompt_version: string | null; models: string[]; created_at: Timestamp }>;

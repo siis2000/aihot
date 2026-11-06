@@ -1,7 +1,7 @@
 // Collection run for one source: fetch listing → filter → store material → enqueue processing.
 // A failed fetch never advances the success cursor; the source's health reflects consecutive failures.
 import { sql, type Db } from "../db.ts";
-import { fillScheduledPublications, FUTURE_TOLERANCE_MS, identityKeyFor, reuseExternalMaterialIdentities, STALE_ON_DISCOVERY_MS, upsertMaterial } from "../content/materials.ts";
+import { fillScheduledPublications, FUTURE_TOLERANCE_MS, identityKeyFor, materialIdentityForUrl, reuseExternalMaterialIdentities, STALE_ON_DISCOVERY_MS, upsertMaterial } from "../content/materials.ts";
 import { PresentationMismatch } from "../content/presentation.ts";
 import { HttpStatusError } from "../lib/http-fetch.ts";
 import { identityKeyForUrl } from "../lib/url.ts";
@@ -76,9 +76,11 @@ export async function listingEntries(source: SourceRow, found: Candidate[]): Pro
   const unreliableDates = source.config.detail?.publishedAtAuthoritative === true;
   const unique = new Map<string, CollectionCandidate>();
   for (const c of candidates) {
-    const identityKey = c.identityKey
+    const requestedIdentity = c.identityKey
       ?? (source.config.preserveUrlFragment === true ? identityKeyForUrl(c.url, { keepFragment: true }) : null)
       ?? identityKeyFor({ ...c, sourceId: source.id, via: "fetch" });
+    const identityKey = requestedIdentity === identityKeyForUrl(c.url)
+      ? await materialIdentityForUrl(c.url) ?? requestedIdentity : requestedIdentity;
     if (!unique.has(identityKey)) unique.set(identityKey, { ...c, identityKey, ...(unreliableDates ? { publishedAt: null, publicationTime: null } : {}) });
   }
   return [...unique.values()];
@@ -123,6 +125,8 @@ export interface DetailReads {
   /** Entries whose page is still to be read: over the budget, after a spent provider budget, or failed. */
   pending: number;
   failures: Array<{ url: string; error: string }>;
+  /** Pages the site refused: its answer, read once and recorded, not a failure of ours. */
+  refused: Array<{ url: string; error: string }>;
   /** The listing date of each entry a page dated under the rules in force, this run or remembered. */
   listed: Map<string, DatedOut[string]>;
   /** Listed entries whose page still fails with a recoverable error. */
@@ -192,7 +196,7 @@ function applyDetail(c: CollectionCandidate, got: Awaited<ReturnType<typeof fetc
 export async function enrichDetails(candidates: CollectionCandidate[], source: SourceRow, known: Map<string, StoredDetail>,
   opts: { budget: number; after?: string; datedOut: DatedOut; retries: Retries; admits: (c: Candidate) => boolean }): Promise<DetailReads> {
   const rules = detailRulesOf(source);
-  const reads: DetailReads = { attempts: 0, pending: 0, failures: [], listed: new Map(), retries: {} };
+  const reads: DetailReads = { attempts: 0, pending: 0, failures: [], refused: [], listed: new Map(), retries: {} };
   let providerBudgetSpent = false;
   const start = candidates.findIndex(c => c.identityKey === opts.after) + 1;
   const ordered = [...candidates.slice(start), ...candidates.slice(0, start)];
@@ -227,12 +231,13 @@ export async function enrichDetails(candidates: CollectionCandidate[], source: S
         if (shutdownSignal.signal.aborted) throw error;
         // A spent provider budget is not the source's failure.
         const failed = !(error instanceof BudgetExceededError);
-        if (!failed) providerBudgetSpent = true;
-        else reads.failures.push({ url: c.url, error: String(error instanceof Error ? error.message : error).slice(0, 300) });
         // A page the site refuses (paywall, captcha, blocked address) is read under these rules once, like
         // a page without the fields: read again on every run it took the budget from the entries behind
         // it. A missing page, a timeout, rate limiting and server errors have recovered, so they are retried.
-        if (error instanceof HttpStatusError && error.status < 500 && ![404, 408, 425, 429].includes(error.status)) {
+        const refused = error instanceof HttpStatusError && error.status < 500 && ![404, 408, 425, 429].includes(error.status);
+        if (!failed) providerBudgetSpent = true;
+        else (refused ? reads.refused : reads.failures).push({ url: c.url, error: String(error instanceof Error ? error.message : error).slice(0, 300) });
+        if (refused) {
           c.detailRules = rules!;
           reads.listed.set(c.identityKey!, [listed, c.publishedAt?.toISOString() ?? null, null]);
         } else {
@@ -246,7 +251,7 @@ export async function enrichDetails(candidates: CollectionCandidate[], source: S
   return reads;
 }
 
-async function store(sourceId: string, runId: number, candidates: CollectionCandidate[], backfill: string | null) {
+async function store(sourceId: string, candidates: CollectionCandidate[], backfill: string | null) {
   let created = 0;
   let revised = 0;
   for (const c of candidates) {
@@ -255,12 +260,8 @@ async function store(sourceId: string, runId: number, candidates: CollectionCand
     try { res = await upsertMaterial(material); }
     catch (error) {
       if (!(error instanceof PresentationMismatch)) throw error;
-      // This article's transaction retained the consistent original and translation. Keep its
-      // actionable failure on the fetch run, without withholding later articles in this listing.
-      await sql`UPDATE fetch_runs SET detail = coalesce(detail,'{}'::jsonb) || jsonb_build_object('presentationFailures',
-        coalesce(detail->'presentationFailures','[]'::jsonb) ||
-          ${sql.json([{ identityKey: identityKeyFor(material), url: c.url, error: error.message }])}::jsonb)
-        WHERE id=${runId}`;
+      // Same wording, a layout the translation cannot follow: the article's transaction retained the
+      // consistent original and translation, which is the outcome; later articles are still stored.
       continue;
     }
     // A successful page with no matching field is complete too. Otherwise an undated article at
@@ -370,7 +371,7 @@ export async function collectSource(sourceId: string, opts: { force?: boolean; x
       retries: source.cursor?.detailRules === rules ? source.cursor?.detailRetries ?? {} : {},
     });
     if (d) {
-      detail = { ...detail, detailAttempts: reads.attempts, detailFailures: reads.failures.length, detailPending: reads.pending, detailErrors: reads.failures };
+      detail = { ...detail, detailAttempts: reads.attempts, detailFailures: reads.failures.length, detailPending: reads.pending, detailErrors: [...reads.failures, ...reads.refused] };
       nextCursor.detailRules = rules;
       if (reads.after) nextCursor.detailAfter = reads.after;
       // A validator covers the whole listing: accept 304 only after its detail work is complete.
@@ -392,7 +393,7 @@ export async function collectSource(sourceId: string, opts: { force?: boolean; x
     if (found) { nextCursor.detailDatedOut = datedOut; nextCursor.detailRetries = reads.retries; }
     if (!d || !Object.keys(nextCursor.detailDatedOut ?? {}).length) delete nextCursor.detailDatedOut;
     if (!d || !Object.keys(nextCursor.detailRetries ?? {}).length) delete nextCursor.detailRetries;
-    const stored = await store(sourceId, run!.id, candidates, firstImport ? "first-import" : null);
+    const stored = await store(sourceId, candidates, firstImport ? "first-import" : null);
     ({ created, revised } = stored);
     for (const id of await fillScheduledPublications(sourceId)) await queueProcessing(id);
 
@@ -433,8 +434,8 @@ function coveredTo(m: SourceRow): bigint {
  * it, and every account keeps its own fetch run, health and cursor. The oldest watermark bounds the
  * search, so no account misses a post (the others only see posts they already have again); afterwards
  * each account's watermark moves to its own newest post the search saw (another account's would hide
- * its late posts and, read on its own, the posts below it), and the stretches still unread are kept in
- * each account's cursor, so they survive a change of shards.
+ * its late posts and, read on its own, the posts below it), and the stretches still unread are kept on
+ * one account of the shard, so they survive a change of shards without every later shard buying them.
  */
 export async function collectXShard(key: string, sourceIds: string[]): Promise<{ key: string; status: "ok" | "failed" | "skipped"; accounts: number; found: number; created: number; error?: string }> {
   const members = (
@@ -450,33 +451,44 @@ export async function collectXShard(key: string, sourceIds: string[]): Promise<{
   let created = 0;
   try {
     const since = members.map(coveredTo).reduce((a, b) => (b < a ? b : a));
-    const backlog: XBacklog[] = [];
-    const stretches = new Set<string>();
-    for (const m of members) {
-      for (const b of (Array.isArray(m.cursor?.xBacklog) ? m.cursor.xBacklog : []) as XBacklog[]) {
-        if (!stretches.has(`${b.query} ${b.next}`)) backlog.push(b);
-        stretches.add(`${b.query} ${b.next}`);
-      }
-    }
+    // readXSearch keeps one copy per query and gives up stretches left over for days.
+    const backlog: XBacklog[] = members.flatMap((m) => (Array.isArray(m.cursor?.xBacklog) ? m.cursor.xBacklog as XBacklog[] : []));
     const read = await readXSearch(shardQuery(members.map((m) => shardHandle(m)!), members.map(selfThreadHandle).filter((h): h is string => h !== null)), { lastId: String(since), backlog, subject: `x-shard:${key}` });
     const detail = { shard: key, accounts: members.length, pages: read.pages, truncated: read.truncated, backlog: read.backlog.length, backlogPages: read.backlogPages, dropped: read.dropped };
     const counts = new Map<string, { found: number; created: number; newest: string }>();
     for (const m of members) {
       const handle = shardHandle(m)!.toLowerCase();
       const mine = read.tweets.filter((t) => t.user.screen_name.toLowerCase() === handle);
-      const stored = await store(m.id, runs.get(m.id)!, admitListing(mine.map(tweetToCandidate), m), null);
+      const stored = await store(m.id, admitListing(mine.map(tweetToCandidate), m), null);
       found += mine.length;
       created += stored.created;
       const newest = mine.reduce((a, t) => (BigInt(t.id_str) > BigInt(a) ? t.id_str : a), String(m.cursor!.lastTweetId));
       counts.set(m.id, { found: mine.length, created: stored.created, newest });
     }
+    // A stretch left over before a regrouping still names accounts now in other shards, which hold no copy
+    // of it and whose coverage has moved on: their posts go to them from here.
+    const here = new Set(members.map((m) => shardHandle(m)!.toLowerCase()));
+    const strays = read.tweets.filter((t) => !here.has(t.user.screen_name.toLowerCase()));
+    if (strays.length) {
+      const owners = await sql<SourceRow[]>`
+        SELECT id, name, kind, config, tier, participation_mode, uses, first_party, interval_minutes, enabled, cursor, fail_count
+        FROM sources WHERE enabled AND ${sharded()}`;
+      for (const owner of owners) {
+        const handle = shardHandle(owner)?.toLowerCase();
+        const mine = strays.filter((t) => t.user.screen_name.toLowerCase() === handle);
+        if (mine.length) created += (await store(owner.id, admitListing(mine.map(tweetToCandidate), owner), null)).created;
+      }
+    }
     // Only a fully stored search advances coverage. A failed write can replay every paid page;
-    // material already committed is idempotent, and no member is left half-finished.
+    // material already committed is idempotent, and no member is left half-finished. The unread stretch
+    // is written once, on the shard's first account: on every member it travelled with them when shards
+    // were regrouped, and each shard then bought its own copy of the same pages.
+    const keeper = members[0]!.id;
     await sql.begin(async tx => {
       for (const m of members) {
         const { newest, ...count } = counts.get(m.id)!;
         const cursor: Record<string, unknown> = { ...m.cursor, lastTweetId: newest, lastOkAt: new Date().toISOString() };
-        if (read.backlog.length) cursor.xBacklog = read.backlog;
+        if (read.backlog.length && m.id === keeper) cursor.xBacklog = read.backlog;
         else delete cursor.xBacklog;
         await recordFetch(tx, m.id, runs.get(m.id)!, { ...count, detail, cursor });
       }
