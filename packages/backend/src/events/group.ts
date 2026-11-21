@@ -67,7 +67,7 @@ interface ArticleRow {
   discovered_at: Date;
   grouped_at: Date | null;
   body_text: string | null;
-  x_post: { tweetId?: string; replyTo?: string | null; quoted?: { url?: string } | null } | null;
+  x_post: { tweetId?: string; replyTo?: string | null; quoted?: { tweetId?: string | null; url?: string } | null } | null;
   source_id: string;
   source_name: string;
   signal_group_id: string | null;
@@ -117,7 +117,7 @@ async function judgeSignal(articleId: string, query: ReportView, cands: Candidat
 
 async function createStory(db: Db, title: string, at: Date): Promise<number> {
   const cleanTitle = editorialPolicy().sanitizeEventCopy
-    ? editorialPolicy().sanitizeEventCopy!({ title, taiwanContext: true }).title.slice(0, 120)
+    ? editorialPolicy().sanitizeEventCopy!({ title }).title.slice(0, 120)
     : title;
   const [row] = await db<{ id: number }[]>`
     INSERT INTO stories (public_id, title, first_report_at, latest_at, origin)
@@ -136,7 +136,6 @@ async function createFact(db: Db, storyId: number, title: string, frame: Record<
         subject: frame?.subject ?? null,
         action: frame?.action ?? null,
         object: frame?.object ?? null,
-        taiwanContext: true,
       })
     : { title, conditions: rawConditions, subject: frame?.subject ?? null, action: frame?.action ?? null, object: frame?.object ?? null };
   const [row] = await db<{ id: number }[]>`
@@ -228,7 +227,6 @@ export async function syncArticleEventCopyTx(tx: Db, articleId: string): Promise
       subject: soleActive && frame ? (frame.subject ?? null) : m.subject,
       action: soleActive && frame ? (frame.action ?? null) : m.action,
       object: soleActive && frame ? (frame.object ?? null) : m.object,
-      taiwanContext: true,
     });
     if (
       cleaned.title !== m.fact_title
@@ -270,7 +268,6 @@ export async function syncArticleEventCopyTx(tx: Db, articleId: string): Promise
     const cleanedStory = sanitizer({
       title: desiredStoryTitle,
       fallbackTitle: fallbackStoryTitle.slice(0, 120),
-      taiwanContext: true,
     });
     if (cleanedStory.title !== m.story_title) {
       await tx`UPDATE stories SET title = ${cleanedStory.title.slice(0, 120)}, updated_at = now() WHERE id = ${storyId}`;
@@ -481,11 +478,11 @@ async function decide(articleId: string, opts: GroupOptions, revision: number, r
   const faceCards = async (selection: SelectionValue, ownFact: number | null = null): Promise<{ selection: SelectionValue; into?: CardRow }> => {
     if (!reader || !selection.addsValue) return { selection };
     if (independent) {
-      const echoes = await echoesOnCard(reader);
+      const echoes = await echoesOnCard(reader, ownFact);
       if (echoes.length) replaces = { ids: echoes.map((echo) => echo.article_id), title: reader.view.title };
       return { selection };
     }
-    const article = await ownArticleOnCard(reader);
+    const article = await ownArticleOnCard(reader, ownFact);
     if (article) return { selection: { addsValue: false, reason: alreadyOnCard(article.title) } };
     if (ownFact && await factHasCard(ownFact)) return { selection };
     const card = await seenOnCard(reader, ownFact);
@@ -514,7 +511,7 @@ async function decide(articleId: string, opts: GroupOptions, revision: number, r
   // nulls from before the value check keep their existing value without buying another judgement.
   if (kept && !recheckSelection) {
     // A retry after the commit below failed still owes the article's replacement; the answers are saved.
-    if (independent) await faceCards({ addsValue: addedValue !== false, reason: "" });
+    if (independent) await faceCards({ addsValue: addedValue !== false, reason: "" }, kept.factId);
     await sql.begin(async (tx) => {
       await markGrouped(articleId, a.revision, undefined, tx);
       await syncArticleEventCopyTx(tx, articleId);
@@ -755,7 +752,7 @@ async function reclaimWaiting(tweetId: string): Promise<number> {
   const posts = await sql<{ id: string }[]>`
     SELECT a.id FROM articles a JOIN sources s ON s.id = a.source_id
     WHERE a.discovered_at > now() - make_interval(hours => ${WAIT_HOURS}) AND ${unattachedSignal}
-      AND (a.x_post->>'replyTo' = ${tweetId} OR substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)') = ${tweetId})`;
+      AND (a.x_post->>'replyTo' = ${tweetId} OR coalesce(a.x_post->'quoted'->>'tweetId', substring(a.x_post->'quoted'->>'url' from '/status/([0-9]+)')) = ${tweetId})`;
   for (const p of posts) await enqueue(QUEUES.group, { articleId: p.id, signalOnly: true }, { singletonKey: p.id, priority: groupingPriority({ signal: true, historical: false }) });
   return posts.length;
 }

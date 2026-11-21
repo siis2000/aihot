@@ -1,4 +1,5 @@
 // What the judging steps read about an article: loaded once per analysis and rendered per step.
+import sharp from "sharp";
 import { describePublicationTime } from "../sources/dates.ts";
 import { sql } from "../db.ts";
 import { collapseWhitespace, htmlBlockText, mergeDistinctText, truncate } from "../lib/text.ts";
@@ -50,11 +51,11 @@ export async function loadAnalyzeInput(articleId: string): Promise<AnalyzeInputA
   const [row] = await sql<{
     id: string; revision: number; title: string; url: string; author: string | null; published_at: Date | null; publication_time: string | null; discovered_at: Date;
     body_text: string | null; body_html: string | null; excerpt: string | null; body_status: string; x_post: Record<string, any> | null; x_article: { title?: string; text?: string; html?: string } | null;
-    cover: Record<string, any> | null; media: Array<Record<string, any>>; source_name: string; source_kind: string; tier: string; selection_class: string | null; first_party: boolean; source_tags: string[]; owner_entity_id: string | null;
+    cover: Record<string, any> | null; media: Array<Record<string, any>>; source_name: string; source_kind: string; tier: string; selection_class: string | null; source_tags: string[]; owner_entity_id: string | null;
     config: Record<string, any>; translation_zh: string | null;
   }[]>`
     SELECT a.id, a.revision, a.title, a.url, a.author, a.published_at, a.publication_time, a.discovered_at, a.body_text, a.body_html, a.excerpt, a.body_status, a.x_post, a.x_article, a.cover, a.media,
-           s.name AS source_name, s.kind AS source_kind, s.tier, s.selection_class, s.first_party, s.tags AS source_tags, s.owner_entity_id, s.config,
+           s.name AS source_name, s.kind AS source_kind, s.tier, s.selection_class, s.tags AS source_tags, s.owner_entity_id, s.config,
            tr.body_text AS translation_zh
     FROM articles a JOIN sources s ON s.id = a.source_id
     LEFT JOIN translations tr ON tr.article_id = a.id AND tr.lang = 'zh' AND tr.revision >= a.revision
@@ -111,6 +112,17 @@ export function buildMaterial(a: AnalyzeInputArticle): string {
   return lines.join("\n");
 }
 
+async function imagePart(body: Buffer, type: string): Promise<ContentPart | null> {
+  if (!/^image\/(jpeg|png|webp)$/.test(type)) return null;
+  const { width, height } = await sharp(body).metadata();
+  // Vision providers reject either side at 10 pixels or below. Pad thin thumbnails without
+  // dropping review evidence, stretching their content or changing the reader's cached image.
+  if (width! <= 10 || height! <= 10) {
+    body = await sharp(body).extend({ top: 0, left: 0, right: Math.max(0, 11 - width!), bottom: Math.max(0, 11 - height!), background: "#fff" }).toBuffer();
+  }
+  return { type: "image_url", image_url: { url: `data:${type};base64,${body.toString("base64")}` } };
+}
+
 /**
  * The article's first image, inlined: models often cannot reach the original hosts, so they get the
  * site's cached thumbnail. None when it cannot be fetched.
@@ -126,7 +138,7 @@ export async function firstImagePart(a: Pick<AnalyzeInputArticle, "media"> & Par
     if (type === "image/svg+xml" && body.length > SVG_PASSTHROUGH_MAX_BYTES) {
       ({ body, type } = await rasterImage(body, type, "thumb"));
     }
-    return /^image\/(jpeg|png|webp)$/.test(type) ? { type: "image_url", image_url: { url: `data:${type};base64,${body.toString("base64")}` } } : null;
+    return await imagePart(body, type);
   } catch {
     return null;
   }
@@ -163,8 +175,9 @@ export async function loadArticleImageParts(urls: readonly string[]): Promise<Ed
           ({ body, type } = await rasterImage(body, type, "thumb"));
         }
       }
-      if (/^image\/(jpeg|png|webp)$/.test(type)) {
-        parts.push({ type: "image_url", image_url: { url: `data:${type};base64,${body.toString("base64")}` } });
+      const part = await imagePart(body, type);
+      if (part) {
+        parts.push(part);
       } else {
         unverifiedCount += 1;
       }

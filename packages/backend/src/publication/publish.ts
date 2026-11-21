@@ -160,8 +160,8 @@ export function v1Payload(p: {
 async function appendLedger(tx: Tx, articleId: string, op: "upsert" | "remove", payload: V1ItemPayload | null, now: Date): Promise<number> {
   await tx`SELECT pg_advisory_xact_lock(hashtext('selected_ledger'))`;
   const { next } = one(await tx<{ next: number }[]>`SELECT coalesce(max(seq), 0) + 1 AS next FROM selected_ledger`);
-  await tx`INSERT INTO selected_ledger (seq, article_id, op, changed_at, visible_at, payload)
-           VALUES (${next}, ${articleId}, ${op}, ${now}, ${now}, ${payload ? tx.json(payload as never) : null})`;
+  await tx`INSERT INTO selected_ledger (seq, article_id, op, changed_at, payload)
+           VALUES (${next}, ${articleId}, ${op}, ${now}, ${payload ? tx.json(payload as never) : null})`;
   return next;
 }
 
@@ -256,7 +256,7 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
     article.grouping_status = "complete";
   }
   const [source] = await tx<SourceFacts[]>`
-    SELECT id, name, kind, tier, participation_mode, first_party, site_fulltext, syndicate_fulltext FROM sources WHERE id = ${article.source_id}`;
+    SELECT id, name, kind, tier, participation_mode, site_fulltext, syndicate_fulltext FROM sources WHERE id = ${article.source_id}`;
   if (!source) return null;
   const [analysis] = await tx<AnalysisRow[]>`
     SELECT id, input_revision, relevance, category, tags, subjects, title_zh, summary_zh, reason_zh, score, selected, output
@@ -293,7 +293,10 @@ export async function publishArticleTx(tx: Tx, articleId: string, options: Publi
   const title = pickString(f.title, original?.title ?? zhTitle ?? (!suppressOriginal && (isChineseTitle || article.x_post) ? collapseWhitespace(article.title) : null));
   const summary = pickString(f.summary, original ? original.summary : analysis?.summary_zh ?? null);
   const category = pickString(f.category, analysis?.category ?? null);
-  const tags = Array.isArray(f.tags) ? (f.tags as string[]) : [...new Set([...(analysis?.tags ?? []), ...(analysis?.subjects ?? []).map((s) => `entity:${s}`)])];
+  const entityTags = (analysis?.subjects ?? []).map((s) => `entity:${s}`);
+  const tags = Array.isArray(f.tags)
+    ? [...new Set([...(f.tags as string[]), ...((f.tags as string[]).some((t) => t.startsWith("entity:")) ? [] : entityTags)])]
+    : [...new Set([...(analysis?.tags ?? []), ...entityTags])];
   const score = f.score === null || typeof f.score === "number" ? f.score : analysis?.score ?? null;
   const relevance = typeof f.relevance === "string" ? (f.relevance as string) : analysis?.relevance ?? null;
   const judgedSelected = typeof f.selected === "boolean" ? (f.selected as boolean) : analysis?.selected ?? null;

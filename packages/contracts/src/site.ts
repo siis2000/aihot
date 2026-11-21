@@ -5,6 +5,8 @@ import type { CategoryKey, ChannelKey } from "./taxonomy.ts";
 import { isoWeekRange, monthDay } from "./time.ts";
 
 export interface SourceRef {
+  /** Stable canonical source id (`sources.id`); optional for legacy/unbacked citations. */
+  id?: string;
   /** The name readers see (publication/rules.ts publicSourceName), as is every source name here. */
   name: string;
 }
@@ -58,6 +60,8 @@ export interface XPostView {
 export interface StoryRef {
   publicId: string;
   title: string;
+  /** The event page stands in search (sourceCount >= STORY_INDEX_MIN_SOURCES). */
+  indexable?: boolean;
 }
 
 /** What every site answer about an article carries; a card and a page each add the X post in their own form. */
@@ -140,6 +144,8 @@ export interface TimelineResponse {
 export interface PoolResponse {
   filters: TimelineFilters & { q: string | null; tab: "time" | "relevance" };
   items: FeedItemSummary[];
+  /** Of the items' tags, each that is a topic's own, with that topic's slug. */
+  tagTopics?: Record<string, string>;
   page: number;
   pageCount: number;
   total: number;
@@ -205,6 +211,7 @@ export interface GroupReportsResponse {
 export const HOT_FACE_LIMIT = 6;
 
 export interface HotParticipant {
+  sourceId?: string;
   name: string;
   kind: "editorial" | "signal";
   /** Only visible faces carry images: the source's icon or its latest collected X avatar (proxied). */
@@ -264,11 +271,12 @@ export interface StoryFactView {
 }
 
 /**
- * An event page stands for its reports in search once it gathers this many public reports (reportCount):
- * with fewer it only repeats its one report's page, so it is noindex and neither the sitemap nor change
- * notifications list it; with as many, its reports' own pages leave Google to it (2026-11-09).
+ * An event page stands for its reports in search once at least this many distinct public editorial sources
+ * cover it (sourceCount): single-source clusters only repeat that source's own pages, so the event page is
+ * noindex and neither the sitemap nor change notifications list it; with multiple sources, its reports' own
+ * pages leave Google to the event page (2026-11-20; previously 2 reports regardless of source).
  */
-export const STORY_INDEX_MIN_REPORTS = 2;
+export const STORY_INDEX_MIN_SOURCES = 2;
 
 export interface StoryDetail {
   publicId: string;
@@ -283,7 +291,7 @@ export interface StoryDetail {
   /** The story's own factual summary, when it has one. */
   summary: string | null;
   /** Without a digest or summary: the summary of the report the story started from. */
-  excerpt: { text: string; sourceName: string } | null;
+  excerpt: { itemId?: string; text: string; sourceId?: string; sourceName: string } | null;
   latest: string | null;
   /** The current public report supplying latest; never inferred from an independently generated digest. */
   latestReport: { id: string } | null;
@@ -324,6 +332,7 @@ export interface ReportCitation {
   itemId: string | null;
   title: string;
   summary: string | null;
+  sourceId?: string | null;
   sourceName: string;
   sourceUrl: string;
   sourceIconUrl: string | null;
@@ -356,7 +365,7 @@ export interface ReportDetail {
   overview: string | null;
   highlights: ReportCitation[];
   /** As edited: daily categories, weekly and monthly themes. */
-  sections: Array<{ label: string; summary: string | null; items: ReportCitation[] }>;
+  sections: Array<{ key?: string; label: string; summary: string | null; items: ReportCitation[] }>;
   flashes: ReportCitation[];
   /**
    * The front page's picture: from the lead item (a daily's lead, a weekly or monthly's first highlight),
@@ -401,6 +410,8 @@ export interface SiteMeta {
 
 /** One entry of the site's changelog (site/changelog.json), newest first. */
 export interface ChangelogRelease {
+  /** Stable canonical release id (e.g. "2026-11-15-1757"). */
+  id?: string;
   date: string;
   time: string;
   kind: "更新" | "优化" | "公告" | "下线";
@@ -447,7 +458,7 @@ export interface SiteStats {
 
 export interface StoryFollowup {
   factId: string;
-  representative: { id: string; title: string; source: { name: string }; timelineAt: string };
+  representative: { id: string; title: string; source: SourceRef; timelineAt: string };
 }
 export interface StoryFollowupsResponse { items: StoryFollowup[]; more: boolean }
 
@@ -501,7 +512,7 @@ export interface TopicSummary extends TopicLink {
   /** Enough content to be listed and indexed. */
   indexable: boolean;
   /** The newest selected report. */
-  latest: { title: string; at: string } | null;
+  latest: { id?: string; title: string; at: string } | null;
 }
 
 export interface TopicsResponse {
@@ -520,6 +531,8 @@ export interface TopicPage {
   /** The site's modules' parts of the page, under their names; each module's web part draws its own. */
   modules: Record<string, unknown>;
   items: FeedItemSummary[];
+  /** Of the items' tags, each that is a topic's own, with that topic's slug. */
+  tagTopics?: Record<string, string>;
   page: number;
   pageCount: number;
   pageSize: number;

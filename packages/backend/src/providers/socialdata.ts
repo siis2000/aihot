@@ -4,6 +4,7 @@ import { guardedFetch } from "../lib/http-fetch.ts";
 import { assertAccepted, paidRequest, ProviderRejectedError, type CallOutcome, type ReceiptRequest, type ReceiptResult } from "./receipts.ts";
 
 export interface SdUser {
+  id_str?: string;
   name: string;
   screen_name: string;
   profile_image_url_https?: string;
@@ -70,7 +71,9 @@ async function get<T>(path: string, request: Omit<ReceiptRequest, "service">,
       headers: { authorization: `Bearer ${key}`, accept: "application/json" },
       timeoutMs: read.timeoutMs,
       maxBytes: read.maxBytes,
-      route: "direct",
+      // Direct search worked while the proxy returned timeouts and upstream errors; the proxy
+      // remains useful when the direct connection itself times out before a request is sent.
+      route: "direct-first",
     });
     if (res.status === 404 && read.missing) return { response: null, usage: read.missing, cost: objectsCost(0) };
     const text = res.text();
